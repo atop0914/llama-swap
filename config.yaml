@@ -1,0 +1,16 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+upstreams:
+  - name: "llama3"
+    url: "http://localhost:8080"
+    api_key: ""
+  - name: "qwen"
+    url: "http://localhost:8000"
+    api_key: ""
+  - name: "ollama"
+    url: "http://localhost:11434"
+    api_key: ""
+
+default_upstream: "llama3"
