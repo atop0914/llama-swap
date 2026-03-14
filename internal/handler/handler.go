@@ -27,10 +27,12 @@ func NewHandler(manager *upstream.Manager, p *proxy.Proxy) *Handler {
 	}
 }
 
+// Health returns health status
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
+// Metrics returns basic statistics
 func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 	jsonResp := map[string]interface{}{
 		"requests": atomic.LoadUint64(&h.stats.Requests),
@@ -38,6 +40,7 @@ func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(jsonResp)
 }
 
+// ListModels returns list of available models
 func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 	upstreams := h.manager.List()
 
@@ -60,37 +63,23 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
-	atomic.AddUint64(&h.stats.Requests, 1)
-
+// getModelName extracts model name from request, falls back to default
+func (h *Handler) getModelName(r *http.Request) string {
 	modelName := r.Header.Get("X-Model")
 	if modelName == "" {
 		modelName = h.manager.GetDefaultName()
 	}
-
-	// Check for streaming
-	if r.Header.Get("Accept") == "text/event-stream" || 
-	   r.Header.Get("Content-Type") == "text/event-stream" {
-		h.proxy.ServeHTTP(w, r, modelName)
-		return
-	}
-
-	h.proxy.ProxyNonStreaming(w, r, modelName)
+	return modelName
 }
 
+// ChatCompletions handles chat completion requests
+func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&h.stats.Requests, 1)
+	h.proxy.Handle(w, r, h.getModelName(r))
+}
+
+// Completions handles text completion requests
 func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&h.stats.Requests, 1)
-
-	modelName := r.Header.Get("X-Model")
-	if modelName == "" {
-		modelName = h.manager.GetDefaultName()
-	}
-
-	// Check for streaming
-	if r.Header.Get("Accept") == "text/event-stream" {
-		h.proxy.ServeHTTP(w, r, modelName)
-		return
-	}
-
-	h.proxy.ProxyNonStreaming(w, r, modelName)
+	h.proxy.Handle(w, r, h.getModelName(r))
 }
