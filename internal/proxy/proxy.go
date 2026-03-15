@@ -2,14 +2,38 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"llama-swap/internal/upstream"
 )
+
+// OpenAIError represents an OpenAI-compatible error response
+type OpenAIError struct {
+	Error OpenAIErrorDetail `json:"error"`
+}
+
+type OpenAIErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
+}
+
+// ErrorResponse represents an error from upstream
+type ErrorResponse struct {
+	Error ErrorDetail `json:"error"`
+}
+
+type ErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
+}
 
 type Proxy struct {
 	client  *http.Client
@@ -144,37 +168,165 @@ func (p *Proxy) doRequest(req *http.Request) (*http.Response, error) {
 
 // copyResponse copies response headers and body to the client
 func (p *Proxy) copyResponse(w http.ResponseWriter, resp *http.Response, streaming bool) {
-	// Copy response headers
+	// Copy response headers (except Transfer-Encoding for streaming)
 	for key, values := range resp.Header {
+		if streaming && strings.ToLower(key) == "transfer-encoding" {
+			continue
+		}
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
 
+	// Handle error responses
+	if resp.StatusCode >= 400 {
+		p.handleErrorResponse(w, resp, streaming)
+		return
+	}
+
 	// Set status
 	w.WriteHeader(resp.StatusCode)
 
-	// Copy body
-	if streaming {
+	// Copy body based on content type
+	contentType := resp.Header.Get("Content-Type")
+	if streaming || strings.Contains(contentType, "text/event-stream") {
 		p.copyBodyStreaming(w, resp.Body)
+	} else if strings.Contains(contentType, "application/json") {
+		p.copyJSONResponse(w, resp.Body)
 	} else {
 		io.Copy(w, resp.Body)
 	}
 }
 
-// copyBodyStreaming copies body with streaming support
+// handleErrorResponse transforms upstream errors to OpenAI-compatible format
+func (p *Proxy) handleErrorResponse(w http.ResponseWriter, resp *http.Response, streaming bool) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		p.sendOpenAIError(w, fmt.Sprintf("upstream error: %v", err), resp.StatusCode)
+		return
+	}
+
+	// Try to parse upstream error response
+	var upstreamErr ErrorResponse
+	if json.Unmarshal(body, &upstreamErr) == nil && upstreamErr.Error.Message != "" {
+		// Transform to OpenAI format
+		p.sendOpenAIError(w, upstreamErr.Error.Message, resp.StatusCode)
+		return
+	}
+
+	// Try to parse other JSON error formats
+	var genericErr map[string]interface{}
+	if json.Unmarshal(body, &genericErr) == nil {
+		if msg, ok := genericErr["message"].(string); ok {
+			p.sendOpenAIError(w, msg, resp.StatusCode)
+			return
+		}
+		if msg, ok := genericErr["error"].(string); ok {
+			p.sendOpenAIError(w, msg, resp.StatusCode)
+			return
+		}
+	}
+
+	// Fallback: use body as message
+	message := string(body)
+	if message == "" {
+		message = fmt.Sprintf("upstream error: %d", resp.StatusCode)
+	}
+	p.sendOpenAIError(w, message, resp.StatusCode)
+}
+
+// sendOpenAIError sends an OpenAI-compatible error response
+func (p *Proxy) sendOpenAIError(w http.ResponseWriter, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	errResp := OpenAIError{
+		Error: OpenAIErrorDetail{
+			Message: message,
+			Type:    "upstream_error",
+			Code:    fmt.Sprintf("%d", statusCode),
+		},
+	}
+
+	json.NewEncoder(w).Encode(errResp)
+}
+
+// copyJSONResponse handles JSON response transformation
+func (p *Proxy) copyJSONResponse(w http.ResponseWriter, body io.Reader) {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		p.sendOpenAIError(w, fmt.Sprintf("failed to read response: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Try to parse and re-encode to ensure valid JSON
+	var jsonBody interface{}
+	if err := json.Unmarshal(data, &jsonBody); err == nil {
+		// Valid JSON, write it
+		w.Write(data)
+	} else {
+		// Not JSON, write as-is
+		w.Write(data)
+	}
+}
+
+// copyBodyStreaming copies body with streaming support (SSE)
 func (p *Proxy) copyBodyStreaming(w http.ResponseWriter, body io.Reader) {
+	// Check if ResponseWriter supports flushing (for streaming)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		io.Copy(w, body)
 		return
 	}
 
+	// Set SSE headers if not already set
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+
+	// Use a larger buffer for better streaming performance
+	buffer := make([]byte, 8192)
+	for {
+		n, err := body.Read(buffer)
+		if n > 0 {
+			// Write data directly, preserving SSE format
+			_, writeErr := w.Write(buffer[:n])
+			if writeErr != nil {
+				log.Printf("Streaming write error: %v", writeErr)
+				break
+			}
+			flusher.Flush()
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Streaming read error: %v", err)
+			}
+			break
+		}
+	}
+}
+
+// copySSEStream properly handles Server-Sent Events stream
+func (p *Proxy) copySSEStream(w http.ResponseWriter, body io.Reader) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		io.Copy(w, body)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
 	buffer := make([]byte, 4096)
 	for {
 		n, err := body.Read(buffer)
 		if n > 0 {
-			w.Write(buffer[:n])
+			_, writeErr := w.Write(buffer[:n])
+			if writeErr != nil {
+				break
+			}
 			flusher.Flush()
 		}
 		if err != nil {
