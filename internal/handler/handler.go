@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync/atomic"
+	"time"
 
+	"llama-swap/internal/logger"
 	"llama-swap/internal/proxy"
 	"llama-swap/internal/upstream"
 )
@@ -75,11 +77,37 @@ func (h *Handler) getModelName(r *http.Request) string {
 // ChatCompletions handles chat completion requests
 func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&h.stats.Requests, 1)
-	h.proxy.Handle(w, r, h.getModelName(r))
+	start := time.Now()
+
+	modelName := h.getModelName(r)
+	logger.Info("Request received",
+		logger.String("method", r.Method),
+		logger.String("path", r.URL.Path),
+		logger.String("model", modelName),
+		logger.String("remote_addr", r.RemoteAddr),
+	)
+
+	h.proxy.Handle(w, r, modelName)
+
+	duration := time.Since(start)
+	logger.Request(r.Method, r.URL.Path, r.RemoteAddr, r.UserAgent(), duration, 0)
 }
 
 // Completions handles text completion requests
 func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&h.stats.Requests, 1)
-	h.proxy.Handle(w, r, h.getModelName(r))
+	start := time.Now()
+
+	modelName := h.getModelName(r)
+	logger.Info("Request received",
+		logger.String("method", r.Method),
+		logger.String("path", r.URL.Path),
+		logger.String("model", modelName),
+		logger.String("remote_addr", r.RemoteAddr),
+	)
+
+	h.proxy.Handle(w, r, modelName)
+
+	duration := time.Since(start)
+	logger.Request(r.Method, r.URL.Path, r.RemoteAddr, r.UserAgent(), duration, 0)
 }

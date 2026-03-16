@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"llama-swap/internal/logger"
 	"llama-swap/internal/upstream"
 )
 
@@ -69,33 +69,45 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request, modelName string)
 // proxyStream handles streaming requests
 func (p *Proxy) proxyStream(w http.ResponseWriter, r *http.Request, u *upstream.Upstream) {
 	upstreamURL := buildUpstreamURL(u.URL, r.URL.Path)
-	logRequest(r.Method, u.Name, r.URL.Path, upstreamURL)
+	start := time.Now()
 
 	req, err := p.buildProxyRequest(r, upstreamURL, u)
 	if err != nil {
+		logger.Error("Failed to build proxy request",
+			logger.String("error", err.Error()),
+			logger.String("model", u.Name),
+			logger.String("path", r.URL.Path),
+		)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	resp, err := p.doRequest(req)
 	if err != nil {
-		log.Printf("Proxy error: %v", err)
+		duration := time.Since(start)
+		logger.ProxyRequest(r.Method, u.Name, r.URL.Path, upstreamURL, duration, 0, err)
 		http.Error(w, fmt.Sprintf("Upstream error: %v", err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
+	duration := time.Since(start)
+	logger.ProxyRequest(r.Method, u.Name, r.URL.Path, upstreamURL, duration, resp.StatusCode, nil)
 	p.copyResponse(w, resp, true)
 }
 
 // proxyNonStream handles non-streaming requests
 func (p *Proxy) proxyNonStream(w http.ResponseWriter, r *http.Request, u *upstream.Upstream) {
 	upstreamURL := buildUpstreamURL(u.URL, r.URL.Path)
-	logRequest(r.Method, u.Name, r.URL.Path, upstreamURL)
+	start := time.Now()
 
 	// Read body for reuse
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		logger.Error("Failed to read request body",
+			logger.String("error", err.Error()),
+			logger.String("model", u.Name),
+		)
 		http.Error(w, fmt.Sprintf("Failed to read request body: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -103,18 +115,25 @@ func (p *Proxy) proxyNonStream(w http.ResponseWriter, r *http.Request, u *upstre
 
 	req, err := p.buildProxyRequestWithBody(r, upstreamURL, u, body)
 	if err != nil {
+		logger.Error("Failed to build proxy request",
+			logger.String("error", err.Error()),
+			logger.String("model", u.Name),
+		)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	resp, err := p.doRequest(req)
 	if err != nil {
-		log.Printf("Proxy error: %v", err)
+		duration := time.Since(start)
+		logger.ProxyRequest(r.Method, u.Name, r.URL.Path, upstreamURL, duration, 0, err)
 		http.Error(w, fmt.Sprintf("Upstream error: %v", err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
+	duration := time.Since(start)
+	logger.ProxyRequest(r.Method, u.Name, r.URL.Path, upstreamURL, duration, resp.StatusCode, nil)
 	p.copyResponse(w, resp, false)
 }
 
@@ -293,14 +312,18 @@ func (p *Proxy) copyBodyStreaming(w http.ResponseWriter, body io.Reader) {
 			// Write data directly, preserving SSE format
 			_, writeErr := w.Write(buffer[:n])
 			if writeErr != nil {
-				log.Printf("Streaming write error: %v", writeErr)
+				logger.Debug("Streaming write error",
+					logger.String("error", writeErr.Error()),
+				)
 				break
 			}
 			flusher.Flush()
 		}
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("Streaming read error: %v", err)
+				logger.Debug("Streaming read error",
+					logger.String("error", err.Error()),
+				)
 			}
 			break
 		}
@@ -347,11 +370,6 @@ func buildUpstreamURL(baseURL, path string) string {
 	return fmt.Sprintf("%s%s", baseURL, path)
 }
 
-// logRequest logs the proxy request
-func logRequest(method, model, path, upstream string) {
-	log.Printf("[%s] %s %s -> %s", method, model, path, upstream)
-}
-
 // ProxyNonStreaming handles non-streaming requests (legacy compatibility)
 func (p *Proxy) ProxyNonStreaming(w http.ResponseWriter, r *http.Request, modelName string) error {
 	u, err := p.manager.Get(modelName)
@@ -360,25 +378,35 @@ func (p *Proxy) ProxyNonStreaming(w http.ResponseWriter, r *http.Request, modelN
 	}
 
 	upstreamURL := buildUpstreamURL(u.URL, r.URL.Path)
-	logRequest(r.Method, u.Name, r.URL.Path, upstreamURL)
+	start := time.Now()
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		logger.Error("Failed to read request body",
+			logger.String("error", err.Error()),
+		)
 		return err
 	}
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
 	req, err := p.buildProxyRequestWithBody(r, upstreamURL, u, body)
 	if err != nil {
+		logger.Error("Failed to build proxy request",
+			logger.String("error", err.Error()),
+		)
 		return err
 	}
 
 	resp, err := p.doRequest(req)
 	if err != nil {
+		duration := time.Since(start)
+		logger.ProxyRequest(r.Method, u.Name, r.URL.Path, upstreamURL, duration, 0, err)
 		return err
 	}
 	defer resp.Body.Close()
 
+	duration := time.Since(start)
+	logger.ProxyRequest(r.Method, u.Name, r.URL.Path, upstreamURL, duration, resp.StatusCode, nil)
 	p.copyResponse(w, resp, false)
 	return nil
 }
